@@ -5,15 +5,15 @@ Orchestrates the full pipeline every 60 seconds during market hours:
   1. Fetch SPX spot + VIX
   2. Fetch OI chain (with 5-min cache)
   3. Run OI analysis (Max Pain, GEX, OI concentration)
-  4. Evaluate all alert rules
-  5. Dedup check (via state_manager stubs — passes all through for now)
-  6. Deliver triggered alerts via Telegram
-  7. Update in-memory state for cross-detection on next cycle
+  4. Save OI snapshot + summary to SQLite
+  5. Evaluate all alert rules (with persistent previous state)
+  6. Dedup check (15-min cooldown via alert_log)
+  7. Deliver triggered alerts via Telegram
+  8. Record delivered alerts to SQLite
 
-Market hours: UTC 13:00–21:00 (configurable via env vars).
-Keeps previous_gex and previous_vix in memory for cross-detection.
+Market hours: UTC 13:00-21:00 (configurable via env vars or alert_config).
+Previous GEX/VIX/OI state is loaded from SQLite on startup (survives restarts).
 
-FUTURE EXTENSION: Replace in-memory state with SQLite via state_manager.py Phase 2
 FUTURE EXTENSION: Configurable polling interval from alert_config table
 FUTURE EXTENSION: Multi-asset support (IBEX 35, etc.) via config/assets.json
 """
@@ -28,21 +28,7 @@ from src.alert_rules import AlertEvent, evaluate_all_alerts
 from src.engines.oi_engine import OIAnalysis, analyze_oi
 from src.gateways.telegram import send_alert, send_startup_message
 from src.market_data import fetch_options_chain, fetch_price
-
-# ---------------------------------------------------------------------------
-# state_manager stubs — inlined until Phase 2 SQLite implementation.
-# state_manager.py remains as documentation/schema reference only.
-# ---------------------------------------------------------------------------
-
-
-def _was_recently_alerted(alert_type: str, key: str, cooldown_minutes: int = 15) -> bool:
-    """Stub: no dedup — all alerts pass through."""
-    return False
-
-
-def _record_alert(event: AlertEvent) -> None:
-    """Stub: log only, no persistence."""
-    log.info("Alert recorded (stub): type=%s severity=%s", event.alert_type, event.severity)
+from src import state_manager
 
 
 log = logging.getLogger("options_alert.scheduler")
@@ -58,16 +44,15 @@ MARKET_CLOSE_UTC: int = int(os.getenv("MARKET_CLOSE_HOUR_UTC", "21"))
 class Scheduler:
     """Main polling scheduler that connects all system components.
 
-    Maintains in-memory state for cycle-over-cycle comparisons
-    (previous GEX, VIX, OI map) until state_manager.py Phase 2
-    provides SQLite-backed persistence.
+    Uses SQLite-backed state_manager for persistence across restarts.
+    Previous GEX, VIX, and OI maps are loaded from the database.
     """
 
     def __init__(self) -> None:
-        self._previous_gex: Optional[float] = None
-        self._previous_vix: Optional[float] = None
-        self._previous_oi_map: dict[float, dict] = {}
         self._cycle_count: int = 0
+        # Initialize SQLite database on startup
+        state_manager.init_db()
+        log.info("State manager inicializado con SQLite")
 
     # -------------------------------------------------------------------
     # Market hours check
@@ -184,13 +169,47 @@ class Scheduler:
                     oi_analysis.gex.regime,
                     self._compute_days_to_expiry(chain.expiry_date),
                 )
+
+                # Save OI snapshot to SQLite for day-over-day comparison
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                strikes_data = [
+                    {
+                        "strike": entry.strike,
+                        "call_oi": entry.call_oi,
+                        "put_oi": entry.put_oi,
+                        "call_volume": 0,
+                        "put_volume": 0,
+                    }
+                    for entry in oi_analysis.oi_concentration
+                ]
+                state_manager.save_oi_snapshot(
+                    symbol=chain.symbol,
+                    expiry_date=chain.expiry_date,
+                    snapshot_date=today_str,
+                    strikes_data=strikes_data,
+                )
+
+                # Save OI summary to SQLite
+                state_manager.save_oi_summary(
+                    symbol=chain.symbol,
+                    expiry_date=chain.expiry_date,
+                    spot=spot,
+                    vix=vix,
+                    max_pain=oi_analysis.max_pain.strike,
+                    net_gex=oi_analysis.gex.net_gex,
+                    gex_regime=oi_analysis.gex.regime,
+                    pc_ratio=oi_analysis.gex.net_gex,  # FUTURE EXTENSION: compute real P/C ratio
+                )
         else:
             log.warning("Cycle %d: OI chain unavailable — limited alert set", cycle_id)
 
-        # 4. Build previous-cycle state for cross detection
-        previous_gex = self._previous_gex
-        previous_vix = self._previous_vix
-        previous_oi_map = self._previous_oi_map
+        # 4. Load previous-cycle state from SQLite for cross detection
+        previous_gex = state_manager.get_previous_gex()
+        previous_vix = state_manager.get_previous_vix()
+        previous_oi_map = state_manager.get_previous_oi_map(
+            symbol=chain.symbol if chain else "^SPX",
+            expiry_date=chain.expiry_date if chain else None,
+        )
 
         # 5. Evaluate all alerts
         alerts = evaluate_all_alerts(
@@ -208,22 +227,24 @@ class Scheduler:
             previous_oi_map=previous_oi_map,
         )
 
-        # 6. Deliver alerts via Telegram (with dedup check)
+        # 6. Deliver alerts via Telegram (with SQLite dedup check)
+        cooldown = int(state_manager.get_config("alert_cooldown_minutes", "15"))
         delivered = 0
         for event in alerts:
             dedup_key = self._build_dedup_key(event)
 
-            if _was_recently_alerted(event.alert_type, dedup_key):
+            if state_manager.was_recently_alerted(event.alert_type, dedup_key, cooldown):
                 log.info(
-                    "Cycle %d: Alert suppressed (cooldown): %s / %s",
+                    "Cycle %d: Alert suppressed (cooldown %dm): %s / %s",
                     cycle_id,
+                    cooldown,
                     event.alert_type,
                     dedup_key,
                 )
                 continue
 
             if send_alert(event):
-                _record_alert(event)
+                state_manager.record_alert(event, dedup_key)
                 delivered += 1
             else:
                 log.warning(
@@ -238,16 +259,6 @@ class Scheduler:
             len(alerts),
             delivered,
         )
-
-        # 7. Update in-memory state for next cycle
-        self._previous_vix = vix
-        if oi_analysis and oi_analysis.gex:
-            self._previous_gex = oi_analysis.gex.net_gex
-        if oi_analysis and oi_analysis.oi_concentration:
-            self._previous_oi_map = {
-                entry.strike: {"call_oi": entry.call_oi, "put_oi": entry.put_oi}
-                for entry in oi_analysis.oi_concentration
-            }
 
     # -------------------------------------------------------------------
     # Main loop
