@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  options-alert:
+    build: .
+    container_name: options_alert_bot
+    restart: unless-stopped        # Se reinicia solo si falla
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
+    env_file:
+      - .env                       # Carga las credenciales
+
+    volumes:
+      - ./data:/app/data           # SQLite persiste fuera del contenedor
+      - ./logs:/app/logs           # Logs accesibles desde Windows
+      - ./config:/app/config       # Config editable sin rebuild
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    # Límites de recursos (ajustable)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
