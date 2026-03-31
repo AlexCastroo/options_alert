@@ -12,7 +12,9 @@
       "Bash(python -m py_compile src/market_data.py)",
       "Bash(python -m py_compile src/engines/oi_engine.py)",
       "Bash(pip install:*)",
-      "Bash(python -m py_compile src/alert_rules.py)"
+      "Bash(python -m py_compile src/alert_rules.py)",
+      "Bash(sqlite3:*)",
+      "Bash(python -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\); [print\\(h[''''expiry''''], h[''''strike''''], h[''''oi'''']\\) for h in d.get\\(''''hits'''',[]\\)]\")"
     ]
   }
 }

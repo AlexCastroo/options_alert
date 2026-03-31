@@ -18,16 +18,18 @@ FUTURE EXTENSION: Configurable polling interval from alert_config table
 FUTURE EXTENSION: Multi-asset support (IBEX 35, etc.) via config/assets.json
 """
 
+import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from src.alert_rules import AlertEvent, evaluate_all_alerts
+from src.alert_rules import AlertEvent, evaluate_all_alerts, check_unusual_otm_oi
+from src.state_manager import get_oi_first_seen_map
 from src.engines.oi_engine import OIAnalysis, analyze_oi
 from src.gateways.telegram import send_alert, send_startup_message
-from src.market_data import fetch_options_chain, fetch_price
+from src.market_data import fetch_options_chain, fetch_price, fetch_all_expiries_chain
 from src import state_manager
 
 
@@ -50,6 +52,8 @@ class Scheduler:
 
     def __init__(self) -> None:
         self._cycle_count: int = 0
+        self._equity_cycle_counter: int = 0
+        self._assets_config: dict = self._load_assets_config()
         # Initialize SQLite database on startup
         state_manager.init_db()
         log.info("State manager inicializado con SQLite")
@@ -115,6 +119,8 @@ class Scheduler:
             return "maxpain_div"
         elif event.alert_type == "OI_BUILDUP":
             return f"buildup_{payload.get('strike', 0):.0f}_{payload.get('side', 'TOTAL')}"
+        elif event.alert_type == "UNUSUAL_OTM_OI":
+            return f"unusual_oi_{payload.get('symbol', 'unknown')}_{payload.get('side', 'unknown')}"
 
         return f"unknown_{event.alert_type}"
 
@@ -260,6 +266,133 @@ class Scheduler:
             delivered,
         )
 
+        # Equity unusual OI scan — runs every N cycles (configurable)
+        self._equity_cycle_counter += 1
+        scan_interval = int(
+            self._assets_config.get("unusual_oi", {}).get("scan_interval_cycles", 5)
+        )
+        if self._equity_cycle_counter >= scan_interval:
+            self._equity_cycle_counter = 0
+            cooldown = int(state_manager.get_config("alert_cooldown_minutes", "15"))
+            self._run_equity_scan(cooldown)
+
+    # -------------------------------------------------------------------
+    # Equity unusual OI scan
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _load_assets_config() -> dict:
+        """Load equity watchlist and thresholds from config/assets.json."""
+        config_path = "config/assets.json"
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            log.info(
+                "Assets config loaded: %d equity tickers",
+                len(cfg.get("equity_options_watchlist", [])),
+            )
+            return cfg
+        except FileNotFoundError:
+            log.warning("config/assets.json not found — equity scan disabled")
+            return {}
+        except Exception:
+            log.exception("Failed to load config/assets.json")
+            return {}
+
+    def _run_equity_scan(self, cooldown: int) -> None:
+        """Scan all enabled equity tickers for unusual deep-OTM OI."""
+        watchlist = self._assets_config.get("equity_options_watchlist", [])
+        oi_cfg = self._assets_config.get("unusual_oi", {})
+        min_oi = int(oi_cfg.get("min_oi_contracts", 30000))
+        min_otm_pct = float(oi_cfg.get("min_otm_pct", 80.0))
+
+        # [TRADING IMPLICATION]: OI es dato diario — cooldown 24h por (symbol, side)
+        oi_cooldown_minutes = 24 * 60
+
+        enabled = [a for a in watchlist if a.get("enabled", True)]
+        log.info("Equity scan starting: %d tickers", len(enabled))
+
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        for asset in enabled:
+            symbol = asset["symbol"]
+            try:
+                spot = fetch_price(symbol)
+                if spot is None:
+                    log.warning("Equity scan: no spot for %s — skipping", symbol)
+                    continue
+
+                chains = fetch_all_expiries_chain(symbol=symbol, spot=spot)
+                if not chains:
+                    log.warning("Equity scan: no chain data for %s — skipping", symbol)
+                    continue
+
+                # Load previous OI maps per expiry BEFORE saving today's snapshots
+                previous_oi_by_expiry: dict = {}
+                for snapshot in chains:
+                    prev = state_manager.get_previous_oi_map(
+                        symbol=symbol,
+                        expiry_date=snapshot.expiry_date,
+                    )
+                    if prev:
+                        previous_oi_by_expiry[snapshot.expiry_date] = prev
+
+                # Save today's OTM-only snapshots (OI > 0) for tomorrow's comparison
+                for snapshot in chains:
+                    spot_snap = snapshot.spot
+                    strikes: dict[float, dict] = {}
+                    for _, row in snapshot.calls[snapshot.calls["strike"] > spot_snap].iterrows():
+                        oi = int(row["openInterest"])
+                        if oi <= 0:
+                            continue
+                        s = float(row["strike"])
+                        strikes.setdefault(s, {"strike": s, "call_oi": 0, "put_oi": 0, "call_volume": 0, "put_volume": 0})
+                        strikes[s]["call_oi"] = oi
+                        strikes[s]["call_volume"] = int(row.get("volume", 0) or 0)
+                    for _, row in snapshot.puts[snapshot.puts["strike"] < spot_snap].iterrows():
+                        oi = int(row["openInterest"])
+                        if oi <= 0:
+                            continue
+                        s = float(row["strike"])
+                        strikes.setdefault(s, {"strike": s, "call_oi": 0, "put_oi": 0, "call_volume": 0, "put_volume": 0})
+                        strikes[s]["put_oi"] = oi
+                        strikes[s]["put_volume"] = int(row.get("volume", 0) or 0)
+                    if strikes:
+                        state_manager.save_oi_snapshot(
+                            symbol=symbol,
+                            expiry_date=snapshot.expiry_date,
+                            snapshot_date=today_str,
+                            strikes_data=list(strikes.values()),
+                        )
+
+                first_seen_map = get_oi_first_seen_map(symbol)
+
+                equity_alerts = check_unusual_otm_oi(
+                    symbol=symbol,
+                    spot=spot,
+                    expiry_chains=chains,
+                    previous_oi_by_expiry=previous_oi_by_expiry,
+                    first_seen_map=first_seen_map,
+                    min_oi=min_oi,
+                    min_otm_pct=min_otm_pct,
+                )
+
+                for event in equity_alerts:
+                    dedup_key = self._build_dedup_key(event)
+                    if state_manager.was_recently_alerted(event.alert_type, dedup_key, oi_cooldown_minutes):
+                        log.info(
+                            "Equity alert suppressed (cooldown 24h): %s / %s",
+                            event.alert_type, dedup_key,
+                        )
+                        continue
+                    if send_alert(event):
+                        state_manager.record_alert(event, dedup_key)
+
+            except Exception:
+                log.exception("Equity scan failed for %s", symbol)
+
+        log.info("Equity scan complete")
+
     # -------------------------------------------------------------------
     # Main loop
     # -------------------------------------------------------------------
@@ -285,6 +418,13 @@ class Scheduler:
             send_startup_message(spot=spot, vix=vix)
         except Exception:
             log.exception("Failed to send startup message — continuing anyway")
+
+        # Run equity scan immediately on startup
+        cooldown_startup = int(state_manager.get_config("alert_cooldown_minutes", "15"))
+        try:
+            self._run_equity_scan(cooldown_startup)
+        except Exception:
+            log.exception("Startup equity scan failed — continuing anyway")
 
         # Main loop
         while True:

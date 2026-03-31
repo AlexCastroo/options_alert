@@ -41,6 +41,7 @@ _ALERT_TYPE_DISPLAY: dict[str, tuple[str, str]] = {
     "VIX_LEVEL": ("\U0001f4c8", "VIX Cruza Umbral"),                    # Chart increasing
     "MAXPAIN_DIVERGENCE": ("\U0001f9f2", "Divergencia Max Pain"),       # Magnet
     "OI_BUILDUP": ("\U0001f4ca", "Acumulacion de OI"),                  # Bar chart
+    "UNUSUAL_OTM_OI": ("\U0001f6a8", "OI Inusual OTM"),               # Siren
 }
 
 
@@ -83,7 +84,7 @@ def _format_alert_message(event: AlertEvent) -> str:
 
     Layout:
         [type_emoji] *Alert Title*  [severity_emoji] SEVERITY
-        ━━━━━━━━━━━━━━━━━━━━━━━━
+        ━━━━━━━━━━━
         [message body - trader language]
 
         📊 Key Metrics:
@@ -127,11 +128,36 @@ def _format_alert_message(event: AlertEvent) -> str:
             formatted_lines.append(f"{prefix} {esc(line)}")
         metrics_section = f"\n\n{metrics_header}\n" + "\n".join(formatted_lines)
 
+    # Expiry table — only for alerts with multi-expiry hit lists
+    table_section = ""
+    if event.alert_type == "UNUSUAL_OTM_OI":
+        hits = event.payload.get("hits", [])
+        current_year = str(datetime.now(timezone.utc).year)
+        hits = [h for h in hits if h.get("expiry", "").startswith(current_year)]
+        if hits:
+            # Columns: Venc.(9) + sp(1) + Strike(6) + sp(1) + OI(8) + sp(1) + FDD(5)
+            # OI starts at offset 17 — date sub-line starts there, left-aligned
+            header_row = f"{'Venc.':<9} {'Strike':>6} {'OI':>8} {'FDD':>5}"
+            divider    = "─" * len(header_row)
+            rows = [header_row, divider]
+            for h in hits:
+                # Reformat expiry date YYYY-MM-DD → DD/MM/YY
+                try:
+                    parts = h["expiry"].split("-")
+                    date_str = f"{parts[2]}/{parts[1]}/{parts[0][2:]}"
+                except Exception:
+                    date_str = h["expiry"]
+                rows.append(
+                    f"{date_str:<9} {h['strike']:>6.0f} {h['oi']:>8,} +{h['otm_pct']:.0f}%"
+                )
+            table_text = "\n".join(rows)
+            table_section = f"\n\n\U0001f4c5 *Vencimientos detectados:*\n```\n{table_text}\n```"
+
     # Timestamp footer
     ts = event.triggered_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     footer = f"\U000023f1 {esc(ts)}"
 
-    message = f"{header}\n{sep}\n\n{body}{metrics_section}\n\n{footer}"
+    message = f"{header}\n{sep}\n\n{body}{metrics_section}{table_section}\n\n{footer}"
     return message
 
 
@@ -179,6 +205,15 @@ def _build_metrics_block(event: AlertEvent) -> list[str]:
         lines.append(f"Cambio: +{p.get('oi_change', 0):,} ({p.get('oi_change_pct', 0):+.1f}%)")
         lines.append(f"OI Actual: {p.get('current_oi', 0):,}")
         lines.append(f"OI Anterior: {p.get('previous_oi', 0):,}")
+
+    elif event.alert_type == "UNUSUAL_OTM_OI":
+        side_es = "Calls (compras)" if p.get("side") == "CALL" else "Puts (ventas)"
+        lines.append(f"Simbolo: {p.get('symbol', 'N/A')}")
+        lines.append(f"Precio actual: {p.get('spot', 0):.2f}")
+        lines.append(f"Tipo: {side_es}")
+        lines.append(f"Strike principal: {p.get('top_strike', 0):,.0f}  (+{p.get('top_otm_pct', 0):.0f}% fuera del dinero)")
+        lines.append(f"Open Interest (OI): {p.get('top_oi', 0):,} contratos")
+        lines.append(f"Strikes detectados: {p.get('total_hits', 0)}")
 
     return lines
 

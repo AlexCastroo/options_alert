@@ -25,7 +25,7 @@ FUTURE EXTENSION: TERM_STRUCTURE_INVERSION — near-term IV > far-term IV
 
 import logging
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Optional, Union
 
 from src.engines.oi_engine import GEXResult, MaxPainResult, OIConcentration
@@ -623,6 +623,247 @@ def check_oi_buildup(
 
 
 # ---------------------------------------------------------------------------
+# 6. UNUSUAL_OTM_OI
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UnusualOTMOIHit:
+    """A single qualifying strike found by the unusual OTM OI scan.
+
+    Attributes:
+        expiry_date: Option expiry date (YYYY-MM-DD).
+        strike: The strike price.
+        side: "CALL" or "PUT".
+        oi: Open interest at this strike.
+        otm_pct: Percentage distance from spot to strike.
+        oi_change_pct: OI % change vs prior day. None if no baseline exists.
+        volume: Intraday volume at this strike today.
+        vol_oi_ratio: volume / oi — proxy for position freshness.
+            >= 0.5 → Fresca (most of OI traded today)
+            >= 0.1 → Activa (significant daily activity)
+            <  0.1 → Antigua (position built over multiple days)
+    """
+
+    expiry_date: str
+    strike: float
+    side: str
+    oi: int
+    otm_pct: float
+    oi_change_pct: Optional[float] = None
+    first_seen: Optional[str] = None  # earliest snapshot_date with OI > 0 for this strike/side
+    volume: int = 0
+    vol_oi_ratio: float = 0.0
+
+
+def _compute_oi_change(
+    current_oi: int,
+    strike: float,
+    side: str,
+    prev_map: dict,
+    buildup_pct: float,
+) -> "float | None | bool":
+    """Compare current OI against prior day baseline.
+
+    Returns:
+        float  — % change vs prior day (positive = buildup).
+        None   — no prior baseline for this strike (new position, allow through).
+        False  — prior baseline exists but growth < buildup_pct (stale, filter out).
+    """
+    prev = prev_map.get(strike)
+    if prev is None:
+        return None  # brand new strike — allow through
+    prev_oi = prev.get("call_oi" if side == "CALL" else "put_oi", 0)
+    if prev_oi <= 0:
+        return None  # was zero before — new position, allow through
+    change_pct = (current_oi - prev_oi) / prev_oi * 100.0
+    if change_pct < buildup_pct:
+        return False  # OI flat or shrinking — stale signal, filter out
+    return round(change_pct, 1)
+
+
+def check_unusual_otm_oi(
+    symbol: str,
+    spot: float,
+    expiry_chains: list,
+    previous_oi_by_expiry: Optional[dict] = None,
+    first_seen_map: Optional[dict] = None,
+    min_oi: int = 30000,
+    min_otm_pct: float = 80.0,
+    buildup_pct: float = 20.0,
+) -> list[AlertEvent]:
+    """Detect unusual OI on deep OTM strikes across all available expiries.
+
+    Scans every expiry in expiry_chains looking for strikes that are both
+    significantly OTM (>= min_otm_pct from spot) and have unusually high
+    OI (>= min_oi contracts). Fires one AlertEvent per side (CALL/PUT)
+    that has at least one qualifying strike, grouped by expiry.
+
+    [TRADING IMPLICATION]: Large OI on deep OTM options signals either
+    institutional tail-risk hedging (far OTM puts) or speculative
+    directional bets on an outlier move (far OTM calls). The combination
+    of deep OTM + high OI is a rare signal — it means smart money is
+    paying for low-probability outcomes, which warrants attention.
+
+    Args:
+        symbol: Equity ticker symbol (e.g. "PYPL", "AAPL").
+        spot: Current spot price of the underlying.
+        expiry_chains: List of OptionsChainSnapshot from
+            fetch_all_expiries_chain(). One entry per expiry date.
+        min_oi: Minimum OI contracts to flag a strike. Default 30,000.
+        min_otm_pct: Minimum % distance from spot to strike. Default 80.0.
+            Formula: (strike - spot) / spot * 100 for calls,
+                     (spot - strike) / spot * 100 for puts.
+
+    Returns:
+        List of AlertEvents — one per qualifying side (CALL/PUT).
+        Empty list if no strikes meet the criteria.
+    """
+    if spot <= 0:
+        log.debug("UNUSUAL_OTM_OI: invalid spot %.2f for %s — skipping", spot, symbol)
+        return []
+
+    if not expiry_chains:
+        log.debug("UNUSUAL_OTM_OI: no chain data for %s — skipping", symbol)
+        return []
+
+    hits: list[UnusualOTMOIHit] = []
+    current_year = str(datetime.now(timezone.utc).year)
+
+    for snapshot in expiry_chains:
+        expiry = snapshot.expiry_date
+        if not expiry.startswith(current_year):
+            continue  # only evaluate current-year expiries
+
+        prev_map       = (previous_oi_by_expiry or {}).get(expiry, {})
+        first_seen_exp = (first_seen_map or {}).get(expiry, {})
+
+        # Calls OTM: strike > spot
+        if not snapshot.calls.empty:
+            for _, row in snapshot.calls[snapshot.calls["strike"] > spot].iterrows():
+                strike = float(row["strike"])
+                oi = int(row["openInterest"])
+                otm_pct = (strike - spot) / spot * 100.0
+                if not (oi >= min_oi and otm_pct >= min_otm_pct):
+                    continue
+                oi_change_pct = _compute_oi_change(oi, strike, "CALL", prev_map, buildup_pct)
+                if oi_change_pct is False:
+                    continue  # stale position — filtered by buildup check
+                volume = int(row.get("volume", 0) or 0)
+                hits.append(UnusualOTMOIHit(
+                    expiry_date=expiry,
+                    strike=strike,
+                    side="CALL",
+                    oi=oi,
+                    otm_pct=round(otm_pct, 1),
+                    oi_change_pct=oi_change_pct,
+                    first_seen=first_seen_exp.get(strike, {}).get("call_first_seen"),
+                    volume=volume,
+                    vol_oi_ratio=round(volume / oi, 3) if oi > 0 else 0.0,
+                ))
+
+        # Puts OTM: strike < spot
+        if not snapshot.puts.empty:
+            for _, row in snapshot.puts[snapshot.puts["strike"] < spot].iterrows():
+                strike = float(row["strike"])
+                oi = int(row["openInterest"])
+                otm_pct = (spot - strike) / spot * 100.0
+                if not (oi >= min_oi and otm_pct >= min_otm_pct):
+                    continue
+                oi_change_pct = _compute_oi_change(oi, strike, "PUT", prev_map, buildup_pct)
+                if oi_change_pct is False:
+                    continue  # stale position — filtered by buildup check
+                volume = int(row.get("volume", 0) or 0)
+                hits.append(UnusualOTMOIHit(
+                    expiry_date=expiry,
+                    strike=strike,
+                    side="PUT",
+                    oi=oi,
+                    otm_pct=round(otm_pct, 1),
+                    oi_change_pct=oi_change_pct,
+                    first_seen=first_seen_exp.get(strike, {}).get("put_first_seen"),
+                    volume=volume,
+                    vol_oi_ratio=round(volume / oi, 3) if oi > 0 else 0.0,
+                ))
+
+    if not hits:
+        return []
+
+    call_hits = sorted([h for h in hits if h.side == "CALL"], key=lambda h: h.oi, reverse=True)
+    put_hits = sorted([h for h in hits if h.side == "PUT"], key=lambda h: h.oi, reverse=True)
+
+    alerts: list[AlertEvent] = []
+
+    def _make_alert(side_hits: list[UnusualOTMOIHit], side: str) -> AlertEvent:
+        top = side_hits[0]
+        severity = "WARNING" if top.oi >= 50000 else "INFO"
+
+        side_es = "Calls (compras)" if side == "CALL" else "Puts (ventas)"
+
+        if side == "CALL":
+            implicacion = (
+                "Apuesta especulativa alcista o cobertura de posicion corta. "
+                "Alguien espera un movimiento fuerte al alza."
+            )
+        else:
+            implicacion = (
+                "Cobertura bajista o apuesta especulativa a la baja. "
+                "Alguien espera un movimiento fuerte a la baja o esta cubriendo riesgo de cola."
+            )
+
+        message = (
+            f"Open Interest (OI) inusual en {side_es} muy alejadas del dinero para {symbol}. "
+            f"Precio actual: {spot:.2f}. "
+            f"{len(side_hits)} strike(s) con OI superior a {min_oi:,} y a mas del {min_otm_pct:.0f}% fuera del dinero. "
+            f"{implicacion}"
+        )
+
+        log.info(
+            "UNUSUAL_OTM_OI triggered: %s %s — %d hits, top=strike %.0f OI=%d (+%.0f%%OTM)",
+            symbol, side, len(side_hits), top.strike, top.oi, top.otm_pct,
+        )
+
+        return AlertEvent(
+            alert_type="UNUSUAL_OTM_OI",
+            severity=severity,
+            title=f"OI Inusual {side_es}: {symbol} @ Strike {top.strike:.0f}",
+            message=message,
+            payload={
+                "symbol": symbol,
+                "spot": spot,
+                "side": side,
+                "total_hits": len(side_hits),
+                "top_strike": top.strike,
+                "top_oi": top.oi,
+                "top_otm_pct": top.otm_pct,
+                "hits": [
+                    {
+                        "expiry": h.expiry_date,
+                        "strike": h.strike,
+                        "oi": h.oi,
+                        "otm_pct": h.otm_pct,
+                        "oi_change_pct": h.oi_change_pct,
+                        "first_seen": h.first_seen,
+                        "volume": h.volume,
+                        "vol_oi_ratio": h.vol_oi_ratio,
+                    }
+                    for h in side_hits[:10]
+                ],
+                "min_oi_threshold": min_oi,
+                "min_otm_pct_threshold": min_otm_pct,
+                "first_seen": side_hits[0].first_seen,
+            },
+        )
+
+    if call_hits:
+        alerts.append(_make_alert(call_hits, "CALL"))
+    if put_hits:
+        alerts.append(_make_alert(put_hits, "PUT"))
+
+    return alerts
+
+
+# ---------------------------------------------------------------------------
 # Alert Registry — extensible without if/else chains
 # ---------------------------------------------------------------------------
 
@@ -635,6 +876,7 @@ ALERT_REGISTRY: dict[str, AlertFunction] = {
     "VIX_LEVEL": check_vix_level,
     "MAXPAIN_DIVERGENCE": check_maxpain_divergence,
     "OI_BUILDUP": check_oi_buildup,
+    "UNUSUAL_OTM_OI": check_unusual_otm_oi,
 }
 
 

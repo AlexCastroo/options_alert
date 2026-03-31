@@ -336,6 +336,110 @@ def fetch_options_chain(
 
 
 # ---------------------------------------------------------------------------
+# Equity all-expiries OI cache — 30-minute TTL
+# OI is exchange-reported once daily; 30-min refresh is more than enough.
+# ---------------------------------------------------------------------------
+_equity_all_expiries_cache: dict[str, tuple[datetime, list["OptionsChainSnapshot"]]] = {}
+_equity_all_expiries_cache_lock = threading.Lock()
+_EQUITY_OI_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
+
+
+def fetch_all_expiries_chain(
+    symbol: str,
+    spot: Optional[float] = None,
+) -> list[OptionsChainSnapshot]:
+    """Fetch the full options chain across ALL available expiries for an equity.
+
+    Used for unusual-OI scanning where we need to look across every expiry
+    date, not just the nearest weekly. Each expiry returns one
+    OptionsChainSnapshot with normalized calls/puts DataFrames.
+
+    Uses a 30-minute cache — OI is exchange-reported once daily, so
+    intraday refreshes beyond 30 minutes add no incremental signal.
+
+    Args:
+        symbol: Equity ticker (e.g. "PYPL"). Not for index symbols (^SPX).
+        spot: Current spot price. If None, fetched via fetch_price().
+
+    Returns:
+        List of OptionsChainSnapshot, one per available expiry.
+        Empty list on any failure.
+    """
+    cache_key = f"{symbol}_all_expiries"
+    with _equity_all_expiries_cache_lock:
+        if cache_key in _equity_all_expiries_cache:
+            cached_time, cached_snapshots = _equity_all_expiries_cache[cache_key]
+            age = (datetime.utcnow() - cached_time).total_seconds()
+            if age < _EQUITY_OI_CACHE_TTL_SECONDS:
+                log.debug(
+                    "Equity OI cache hit: %s (age=%.0fs, TTL=%ds)",
+                    symbol, age, _EQUITY_OI_CACHE_TTL_SECONDS,
+                )
+                return cached_snapshots
+
+    log.info("Fetching all-expiries OI chain for equity %s", symbol)
+
+    try:
+        ticker = yf.Ticker(symbol)
+        available_expiries = list(ticker.options)
+
+        if not available_expiries:
+            log.error("No options expiries available for %s", symbol)
+            return []
+
+        if spot is None:
+            spot = fetch_price(symbol)
+            if spot is None:
+                log.error("Could not fetch spot price for %s", symbol)
+                return []
+
+        log.info(
+            "%s: spot=%.2f — scanning %d expiries",
+            symbol, spot, len(available_expiries),
+        )
+
+        snapshots: list[OptionsChainSnapshot] = []
+
+        for expiry in available_expiries:
+            try:
+                chain = ticker.option_chain(expiry)
+                calls = _normalize_chain(chain.calls)
+                puts = _normalize_chain(chain.puts)
+
+                if calls.empty and puts.empty:
+                    log.debug("Empty chain for %s expiry %s — skipping", symbol, expiry)
+                    continue
+
+                snapshots.append(OptionsChainSnapshot(
+                    symbol=symbol,
+                    expiry_date=expiry,
+                    spot=spot,
+                    calls=calls,
+                    puts=puts,
+                ))
+            except Exception:
+                log.warning(
+                    "Failed to fetch %s expiry %s — skipping",
+                    symbol, expiry, exc_info=True,
+                )
+                continue
+
+        log.info(
+            "%s: fetched %d of %d expiry chains",
+            symbol, len(snapshots), len(available_expiries),
+        )
+
+        with _equity_all_expiries_cache_lock:
+            _equity_all_expiries_cache[cache_key] = (datetime.utcnow(), snapshots)
+
+        return snapshots
+
+    except Exception:
+        log.exception("Failed to fetch all-expiries chain for %s", symbol)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Lightweight spot/VIX price fetch via raw Yahoo Finance API
 # ---------------------------------------------------------------------------
 

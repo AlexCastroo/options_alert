@@ -466,3 +466,42 @@ def cleanup_old_data(days_to_keep: int = 30) -> None:
             deleted_alerts,
             days_to_keep,
         )
+
+
+def get_oi_first_seen_map(symbol: str) -> dict:
+    """Return the earliest snapshot_date where OI > 0 for each (expiry, strike, side).
+
+    Used to show how long an unusual OTM OI position has existed.
+
+    Args:
+        symbol: Equity ticker symbol.
+
+    Returns:
+        Nested dict: {expiry_date: {strike: {"call_first_seen": str|None, "put_first_seen": str|None}}}
+    """
+    conn = _get_connection()
+    rows = conn.execute(
+        """
+        SELECT
+            expiry_date,
+            strike,
+            MIN(CASE WHEN call_oi > 0 THEN snapshot_date END) AS call_first_seen,
+            MIN(CASE WHEN put_oi  > 0 THEN snapshot_date END) AS put_first_seen
+        FROM oi_snapshots
+        WHERE symbol = ?
+        GROUP BY expiry_date, strike
+        """,
+        (symbol,),
+    ).fetchall()
+
+    result: dict = {}
+    for row in rows:
+        expiry = row["expiry_date"]
+        strike = row["strike"]
+        if expiry not in result:
+            result[expiry] = {}
+        result[expiry][strike] = {
+            "call_first_seen": row["call_first_seen"],
+            "put_first_seen": row["put_first_seen"],
+        }
+    return result
